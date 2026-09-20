@@ -65,6 +65,7 @@ import {RenderPass} from 'three/addons/postprocessing/RenderPass.js';
 import {UnrealBloomPass} from 'three/addons/postprocessing/UnrealBloomPass.js';
 import {ShaderPass} from 'three/addons/postprocessing/ShaderPass.js';
 import {SMAAPass} from 'three/addons/postprocessing/SMAAPass.js';
+import {GTAOPass} from 'three/addons/postprocessing/GTAOPass.js';
 import {OutputPass} from 'three/addons/postprocessing/OutputPass.js';
 import * as BGU from 'three/addons/utils/BufferGeometryUtils.js';
 
@@ -86,11 +87,66 @@ renderer.setSize(innerWidth, innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.18;
+renderer.toneMappingExposure = 1.02;
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(72, innerWidth/innerHeight, 0.04, 400);
+
+/** Окружение для отражений: без него metalness-поверхности выходят чёрными. */
+/** Купол неба. Без него сквозь проёмы кровли видно чёрный фон,
+    и дыры читаются как пятна черноты вместо источников света. */
+function buildSky(){
+  const [c,x] = cv(64,256);
+  const g = x.createLinearGradient(0,0,0,256);
+  g.addColorStop(0.00, '#7d9fc4');   // зенит
+  g.addColorStop(0.42, '#aec4dc');
+  g.addColorStop(0.62, '#d3dae2');   // горизонт в дымке
+  g.addColorStop(0.80, '#c6c0b4');
+  g.addColorStop(1.00, '#9a9186');   // земля/пыль
+  x.fillStyle=g; x.fillRect(0,0,64,256);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.mapping = THREE.EquirectangularReflectionMapping;
+  const dome = new THREE.Mesh(
+    new THREE.SphereGeometry(180, 24, 16),
+    new THREE.MeshBasicMaterial({map:t, side:THREE.BackSide, fog:false, toneMapped:true}));
+  dome.name='sky';
+  scene.add(dome);
+  SKY = dome;
+}
+let SKY = null;
+function buildEnvironment(){
+  const [c,x] = cv(256,128);
+  // верх — свет из кровли, середина — стены ангара, низ — бетонный пол
+  const g = x.createLinearGradient(0,0,0,128);
+  g.addColorStop(0.00, '#cfd8e2');
+  g.addColorStop(0.34, '#a8a49b');
+  g.addColorStop(0.52, '#7d786f');
+  g.addColorStop(0.72, '#6b665e');
+  g.addColorStop(1.00, '#514c45');
+  x.fillStyle=g; x.fillRect(0,0,256,128);
+  // яркие пятна — имитация световых проёмов и ленточных окон
+  for(let i=0;i<9;i++){
+    const px=Math.random()*256, py=Math.random()*26;
+    const rg=x.createRadialGradient(px,py,1,px,py,26);
+    rg.addColorStop(0,'rgba(255,250,238,.85)'); rg.addColorStop(1,'rgba(255,250,238,0)');
+    x.fillStyle=rg; x.fillRect(px-26,py-26,52,52);
+  }
+  for(let i=0;i<14;i++){
+    const px=Math.random()*256, py=38+Math.random()*10;
+    x.fillStyle='rgba(226,234,242,.55)';
+    x.fillRect(px, py, 16, 5);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  pmrem.compileEquirectangularShader();
+  const env = pmrem.fromEquirectangular(tex).texture;
+  pmrem.dispose(); tex.dispose();
+  scene.environment = env;
+}
 
 /* ============================================================================
    ПРОЦЕДУРНЫЕ ТЕКСТУРЫ: albedo + карта высот → normal + roughness
@@ -110,6 +166,29 @@ function grain(x, w, h, amt){
     d[i]=clamp(d[i]+n,0,255); d[i+1]=clamp(d[i+1]+n,0,255); d[i+2]=clamp(d[i+2]+n,0,255);
   }
   x.putImageData(img,0,0);
+}
+/** Карта высот → AO: усреднённая окклюзия по окрестности, углубления темнее. */
+function heightToAO(hc, power=1.0){
+  const sz = hc.width, hx = hc.getContext('2d');
+  const src = hx.getImageData(0,0,sz,sz).data;
+  const [ac, ax] = cv(sz,sz);
+  const out = ax.createImageData(sz,sz), o = out.data;
+  const H = (x,y)=> src[(((y+sz)%sz)*sz + ((x+sz)%sz))*4] / 255;
+  const R = 4;
+  for(let y=0;y<sz;y++) for(let x=0;x<sz;x++){
+    const h = H(x,y);
+    let higher = 0, n = 0;
+    for(let dy=-R; dy<=R; dy+=2) for(let dx=-R; dx<=R; dx+=2){
+      if(!dx && !dy) continue;
+      higher += Math.max(0, H(x+dx,y+dy) - h); n++;
+    }
+    const occ = clamp(1 - (higher/n)*5.0*power, 0, 1);
+    const v = Math.round(clamp(0.35 + occ*0.65, 0, 1)*255);
+    const i = (y*sz+x)*4;
+    o[i]=o[i+1]=o[i+2]=v; o[i+3]=255;
+  }
+  ax.putImageData(out,0,0);
+  return ac;
 }
 /** Карта высот (градации серого canvas) → нормаль-карта. */
 function heightToNormal(hc, strength=2.0){
@@ -143,72 +222,109 @@ function T(canvas, rx=1, ry=1, srgb=true){
 }
 
 /* ---------- OSB: стружка, уложенная слоями ---------- */
-function osbMaps(size=768, tint=1){
+function osbMaps(size=1024, tint=1){
   const [c,x] = cv(size,size);
   const [h,hx] = cv(size,size);
-  x.fillStyle = `rgb(${168*tint|0},${131*tint|0},${80*tint|0})`; x.fillRect(0,0,size,size);
-  hx.fillStyle = '#7e7e7e'; hx.fillRect(0,0,size,size);
-  // три слоя стружки: нижний хаотичный, средний поперечный, верхний продольный
+  const [rg,rx] = cv(size,size);
+  // Текстура покрывает ~1.22 м (ширина листа) → 1 px ≈ 1.2 мм.
+  // Реальная щепа ОСП: длина 50-150 мм, ширина 10-25 мм → 40-125 px x 8-20 px.
+  x.fillStyle = `rgb(${206*tint|0},${181*tint|0},${136*tint|0})`; x.fillRect(0,0,size,size);
+  hx.fillStyle = '#6a6a6a'; hx.fillRect(0,0,size,size);
+  rx.fillStyle = '#b8b8b8'; rx.fillRect(0,0,size,size);
+
   const layers = [
-    {n:2400, a:()=>sr(0,6.283), w:[20,74], hgt:[6,15], op:[.4,.85], hz:[0.40,0.54]},
-    {n:1900, a:()=>sr(1.30,1.84), w:[26,92], hgt:[7,17], op:[.38,.8], hz:[0.50,0.64]},
-    {n:1800, a:()=>sr(-0.26,0.26), w:[30,104], hgt:[8,19], op:[.42,.86], hz:[0.60,0.78]}
+    {n:1400, a:()=>sr(0,6.283),                    w:[44,120], hgt:[9,19],  op:[.55,.85], hz:[0.30,0.48]},
+    {n:1100, a:()=>sr(0,6.283),                    w:[50,132], hgt:[10,21], op:[.5,.82],  hz:[0.46,0.64]},
+    // верхний слой ориентирован вдоль листа, но с широким разбросом ±35°
+    {n:1500, a:()=>sr(-0.62,0.62) + (srnd()<0.18 ? 1.57 : 0), w:[56,148], hgt:[10,23], op:[.55,.88], hz:[0.62,0.84]}
   ];
   for(const L of layers){
     for(let i=0;i<L.n;i++){
       const w = sr(L.w[0],L.w[1]), hh = sr(L.hgt[0],L.hgt[1]), a = L.a();
       const px = srnd()*size, py = srnd()*size;
-      const lum = sr(0.74,1.16);
-      const r = clamp(186*lum*tint,0,255)|0, g = clamp(146*lum*tint,0,255)|0, b = clamp(88*lum*tint,0,255)|0;
-      const op = sr(L.op[0],L.op[1]);
-      const hv = Math.round(sr(L.hz[0],L.hz[1])*255);
+      // Щепа берётся из разных частей ствола: светлая заболонь и тёмное ядро.
+      const lum = sr(0.88, 1.08);
+      const warm = sr(0.88, 1.06);
+      const r = clamp(224*lum*tint, 0, 255)|0,
+            g = clamp(199*lum*tint*warm, 0, 255)|0,
+            b = clamp(152*lum*tint*warm*sr(0.94,1.05), 0, 255)|0;
+      const op = sr(L.op[0], L.op[1]);
+      const hv = Math.round(sr(L.hz[0], L.hz[1])*255);
+      const rr = Math.min(hh*0.42, 5);
+      const rv = si(140, 210);
+
       wrapDraw(x, size, ()=>{
         x.save(); x.translate(px,py); x.rotate(a);
         x.fillStyle = `rgba(${r},${g},${b},${op})`;
-        x.fillRect(-w/2,-hh/2,w,hh);
-        // продольные волокна внутри щепы
-        x.strokeStyle = `rgba(${clamp(r*0.82,0,255)|0},${clamp(g*0.8,0,255)|0},${clamp(b*0.74,0,255)|0},.18)`;
-        x.lineWidth = 0.55;
-        for(let k=1;k<3;k++){
-          const yy = -hh/2 + hh*k/3;
-          x.beginPath(); x.moveTo(-w/2,yy); x.lineTo(w/2,yy); x.stroke();
+        x.beginPath(); x.roundRect(-w/2,-hh/2,w,hh, rr); x.fill();
+        // продольные волокна древесины вдоль щепы
+        x.strokeStyle = `rgba(${clamp(r*0.80,0,255)|0},${clamp(g*0.76,0,255)|0},${clamp(b*0.68,0,255)|0},.14)`;
+        x.lineWidth = 0.7;
+        const fib = 2 + Math.floor(hh/6);
+        for(let k=1;k<fib;k++){
+          const yy = -hh/2 + hh*k/fib;
+          x.beginPath(); x.moveTo(-w/2+rr, yy); x.lineTo(w/2-rr, yy); x.stroke();
         }
-        // обводка щепы только местами и слабая: жирный контур читается как кирпич
-        if(srnd() < 0.42){
-          x.strokeStyle = `rgba(${clamp(r*0.66,0,255)|0},${clamp(g*0.62,0,255)|0},${clamp(b*0.56,0,255)|0},.22)`;
-          x.lineWidth = 0.7; x.strokeRect(-w/2,-hh/2,w,hh);
-        }
+        // тень по контуру: щепа лежит слоями, между ними видны зазоры
+        x.strokeStyle = `rgba(${clamp(r*0.64,0,255)|0},${clamp(g*0.60,0,255)|0},${clamp(b*0.54,0,255)|0},.20)`;
+        x.lineWidth = 0.8;
+        x.beginPath(); x.roundRect(-w/2,-hh/2,w,hh, rr); x.stroke();
         x.restore();
       });
       wrapDraw(hx, size, ()=>{
         hx.save(); hx.translate(px,py); hx.rotate(a);
         hx.fillStyle = `rgba(${hv},${hv},${hv},${op})`;
-        hx.fillRect(-w/2,-hh/2,w,hh);
-        hx.strokeStyle = 'rgba(64,64,64,.28)'; hx.lineWidth = 0.9;
-        hx.strokeRect(-w/2,-hh/2,w,hh);
+        hx.beginPath(); hx.roundRect(-w/2,-hh/2,w,hh, rr); hx.fill();
+        hx.strokeStyle = 'rgba(32,32,32,.55)'; hx.lineWidth = 1.3;
+        hx.beginPath(); hx.roundRect(-w/2,-hh/2,w,hh, rr); hx.stroke();
         hx.restore();
+      });
+      wrapDraw(rx, size, ()=>{
+        rx.save(); rx.translate(px,py); rx.rotate(a);
+        rx.fillStyle = `rgba(${rv},${rv},${rv},${op*0.8})`;
+        rx.beginPath(); rx.roundRect(-w/2,-hh/2,w,hh, rr); rx.fill();
+        rx.strokeStyle = 'rgba(248,248,248,.55)'; rx.lineWidth = 1.4;
+        rx.beginPath(); rx.roundRect(-w/2,-hh/2,w,hh, rr); rx.stroke();
+        rx.restore();
       });
     }
   }
-  // смоляные пятна
-  for(let i=0;i<90;i++){
-    const px=srnd()*size, py=srnd()*size, r=sr(24,110), al=sr(.05,.16);
+  // смоляные глянцевые пятна
+  for(let i=0;i<110;i++){
+    const px=srnd()*size, py=srnd()*size, r=sr(20,120), al=sr(.05,.17);
     wrapDraw(x, size, ()=>{
       const g = x.createRadialGradient(px,py,2,px,py,r);
-      g.addColorStop(0,`rgba(104,74,36,${al})`); g.addColorStop(1,'rgba(104,74,36,0)');
+      g.addColorStop(0,`rgba(146,116,72,${al*0.8})`); g.addColorStop(1,'rgba(146,116,72,0)');
+      x.fillStyle=g; x.beginPath(); x.arc(px,py,r,0,7); x.fill();
+    });
+    wrapDraw(rx, size, ()=>{
+      const g = rx.createRadialGradient(px,py,2,px,py,r);
+      g.addColorStop(0,`rgba(84,84,84,${al*2.8})`); g.addColorStop(1,'rgba(84,84,84,0)');
+      rx.fillStyle=g; rx.beginPath(); rx.arc(px,py,r,0,7); rx.fill();
+    });
+  }
+  // светлая древесная пыль в углублениях
+  for(let i=0;i<150;i++){
+    const px=srnd()*size, py=srnd()*size, r=sr(10,58), v=si(186,214);
+    wrapDraw(x, size, ()=>{
+      const g = x.createRadialGradient(px,py,1,px,py,r);
+      g.addColorStop(0,`rgba(${v+16},${v+6},${v-14},${sr(.07,.18)})`); g.addColorStop(1,'rgba(0,0,0,0)');
       x.fillStyle=g; x.beginPath(); x.arc(px,py,r,0,7); x.fill();
     });
   }
-  grain(x,size,size,0.035);
-  return {albedo:c, height:h};
+  grain(x,size,size,0.028);
+  return {albedo:c, height:h, rough:rg};
 }
 
 /* ---------- Бетонный пол ---------- */
 function concreteMaps(size=768){
   const [c,x] = cv(size,size);
   const [h,hx] = cv(size,size);
-  x.fillStyle='#928c81'; x.fillRect(0,0,size,size);
+  const [rg,rx] = cv(size,size);
+  // Промышленный бетон — нейтрально-серый с лёгкой тёплой примесью, не бежевый.
+  x.fillStyle='#93908a'; x.fillRect(0,0,size,size);
   hx.fillStyle='#aaaaaa'; hx.fillRect(0,0,size,size);
+  rx.fillStyle='#e0e0e0'; rx.fillRect(0,0,size,size);
   // облачные пятна затирки
   for(let i=0;i<340;i++){
     const v = si(112,168);
@@ -229,12 +345,32 @@ function concreteMaps(size=768){
         x.beginPath(); x.arc(px,py,r,0,7); x.fill(); });
     }
   }
-  // масляные и грязевые разводы
+  // масляные и грязевые разводы: тёмные и глянцевые
   for(let i=0;i<26;i++){
-    const px=srnd()*size, py=srnd()*size, r=sr(40,150), v=si(40,72), al=sr(.10,.26);
+    const px=srnd()*size, py=srnd()*size, r=sr(40,150), v=si(38,68), al=sr(.12,.30);
     wrapDraw(x, size, ()=>{
       const g=x.createRadialGradient(px,py,2,px,py,r);
-      g.addColorStop(0,`rgba(${v},${v-2},${v-6},${al})`); g.addColorStop(1,'rgba(0,0,0,0)');
+      g.addColorStop(0,`rgba(${v},${v-1},${v+2},${al})`); g.addColorStop(1,'rgba(0,0,0,0)');
+      x.fillStyle=g; x.beginPath(); x.arc(px,py,r,0,7); x.fill();
+    });
+    wrapDraw(rx, size, ()=>{
+      const g=rx.createRadialGradient(px,py,2,px,py,r);
+      g.addColorStop(0,`rgba(74,74,74,${al*2.2})`); g.addColorStop(1,'rgba(74,74,74,0)');
+      rx.fillStyle=g; rx.beginPath(); rx.arc(px,py,r,0,7); rx.fill();
+    });
+  }
+  // затёртые до глянца проезды и пятна цементного молока
+  for(let i=0;i<18;i++){
+    const px=srnd()*size, py=srnd()*size, r=sr(60,180);
+    wrapDraw(rx, size, ()=>{
+      const g=rx.createRadialGradient(px,py,2,px,py,r);
+      g.addColorStop(0,`rgba(168,168,168,${sr(.15,.4)})`); g.addColorStop(1,'rgba(168,168,168,0)');
+      rx.fillStyle=g; rx.beginPath(); rx.arc(px,py,r,0,7); rx.fill();
+    });
+    wrapDraw(x, size, ()=>{
+      const v=si(150,178);
+      const g=x.createRadialGradient(px,py,2,px,py,r);
+      g.addColorStop(0,`rgba(${v},${v},${v-3},${sr(.04,.12)})`); g.addColorStop(1,'rgba(0,0,0,0)');
       x.fillStyle=g; x.beginPath(); x.arc(px,py,r,0,7); x.fill();
     });
   }
@@ -250,38 +386,35 @@ function concreteMaps(size=768){
     ctx.stroke();
     return [cx,cy,a];
   }
-  for(let i=0;i<9;i++){
-    const px=srnd()*size, py=srnd()*size, a=sr(0,6.28), w=sr(0.8,1.9);
+  for(let i=0;i<5;i++){
+    const px=srnd()*size, py=srnd()*size, a=sr(0,6.28), w=sr(0.6,1.3);
     wrapDraw(x, size, ()=>{
-      const [ex,ey,ea] = crack(x,px,py,a,15,w,'rgba(54,51,48,.42)');
-      if(srnd()<0.75) crack(x,ex,ey,ea+sr(0.5,1.2),8,w*0.6,'rgba(54,51,48,.32)');
+      const [ex,ey,ea] = crack(x,px,py,a,9,w,'rgba(58,55,52,.34)');
+      if(srnd()<0.6) crack(x,ex,ey,ea+sr(0.5,1.2),5,w*0.6,'rgba(58,55,52,.24)');
     });
     wrapDraw(hx, size, ()=>{
-      const [ex,ey,ea] = crack(hx,px,py,a,15,w*1.3,'rgba(40,40,40,.8)');
-      if(srnd()<0.75) crack(hx,ex,ey,ea+sr(0.5,1.2),8,w*0.8,'rgba(40,40,40,.6)');
+      const [ex,ey,ea] = crack(hx,px,py,a,9,w*1.3,'rgba(44,44,44,.7)');
+      if(srnd()<0.6) crack(hx,ex,ey,ea+sr(0.5,1.2),5,w*0.8,'rgba(44,44,44,.5)');
     });
   }
-  // деформационные швы
-  for(const t of [0.5]){
-    x.strokeStyle='rgba(66,63,59,.5)'; x.lineWidth=3;
-    x.beginPath(); x.moveTo(0,size*t); x.lineTo(size,size*t); x.moveTo(size*t,0); x.lineTo(size*t,size); x.stroke();
-    hx.strokeStyle='rgba(56,56,56,.9)'; hx.lineWidth=4;
-    hx.beginPath(); hx.moveTo(0,size*t); hx.lineTo(size,size*t); hx.moveTo(size*t,0); hx.lineTo(size*t,size); hx.stroke();
-  }
-  grain(x,size,size,0.04);
-  return {albedo:c, height:h};
+  // Швы плит НЕ рисуем в текстуре: при тайлинге они дают регулярную решётку.
+  // Вместо этого швы кладутся отдельной геометрией по границам плит пола.
+  grain(x,size,size,0.035);
+  return {albedo:c, height:h, rough:rg};
 }
 
 /* ---------- Пиломатериал каркаса ---------- */
 function lumberMaps(size=512){
   const [c,x] = cv(size,size);
   const [h,hx] = cv(size,size);
-  x.fillStyle='#c2a273'; x.fillRect(0,0,size,size);
+  const [rg,rx] = cv(size,size);
+  x.fillStyle='#c6b189'; x.fillRect(0,0,size,size);
   hx.fillStyle='#909090'; hx.fillRect(0,0,size,size);
+  rx.fillStyle='#cdcdcd'; rx.fillRect(0,0,size,size);
   for(let i=0;i<size;i+=1){
     const w = sr(0.8,2.6);
-    const v = si(150,215);
-    x.strokeStyle = `rgba(${v},${(v*0.79)|0},${(v*0.53)|0},${sr(.18,.5)})`;
+    const v = si(158,218);
+    x.strokeStyle = `rgba(${v},${(v*0.88)|0},${(v*0.66)|0},${sr(.16,.44)})`;
     x.lineWidth = w; x.beginPath();
     x.moveTo(0, i + Math.sin(i*0.21)*2.2); x.lineTo(size, i + Math.cos(i*0.17)*2.6); x.stroke();
     const hv = si(120,180);
@@ -301,29 +434,44 @@ function lumberMaps(size=512){
       hx.fillStyle=g; hx.beginPath(); hx.arc(px,py,r,0,7); hx.fill();
     });
   }
-  grain(x,size,size,0.035);
-  return {albedo:c, height:h};
+  // строганые грани глаже, распил шершавее
+  for(let i=0;i<90;i++){
+    const px=srnd()*size, py=srnd()*size, r=sr(10,54), v=si(120,205);
+    wrapDraw(rx, size, ()=>{
+      const g=rx.createRadialGradient(px,py,1,px,py,r);
+      g.addColorStop(0,`rgba(${v},${v},${v},${sr(.1,.3)})`); g.addColorStop(1,'rgba(0,0,0,0)');
+      rx.fillStyle=g; rx.beginPath(); rx.arc(px,py,r,0,7); rx.fill();
+    });
+  }
+  grain(x,size,size,0.03);
+  return {albedo:c, height:h, rough:rg};
 }
 
 /* ---------- Профлист (стены и кровля ангара) ---------- */
 function corrugatedMaps(size=512, rust=0.5, base=[118,112,104], ribs=7){
   const [c,x] = cv(size,size);
   const [h,hx] = cv(size,size);
+  const [rg,rx] = cv(size,size);
+  rx.fillStyle='#8a8a8a'; rx.fillRect(0,0,size,size);
   for(let i=0;i<size;i++){
-    const ph = i/size*Math.PI*2*ribs;
-    const s = 0.5 + 0.5*Math.sin(ph);
-    // трапеция вместо синуса — ближе к настоящему профнастилу
-    const trap = clamp((s-0.18)/0.64, 0, 1);
-    const k = 0.52 + trap*0.62;
+    // Трапециевидный профиль: широкая полка, наклонная стенка, узкая канавка.
+    const t = (i/size*ribs) % 1;
+    let prof;                                   // 0 = дно канавки, 1 = верх полки
+    if(t < 0.58)      prof = 1.0;                    // широкая верхняя полка
+    else if(t < 0.70) prof = 1.0 - (t-0.58)/0.12;    // стенка вниз
+    else if(t < 0.88) prof = 0.06;                   // узкое дно
+    else              prof = (t-0.88)/0.12;          // стенка вверх
+    // мягкий перепад: дно лишь притенено, а не чёрное
+    const k = 0.80 + prof*0.30 + (prof>0.08&&prof<0.94 ? -0.06 : 0);
     x.fillStyle = `rgb(${clamp(base[0]*k,0,255)|0},${clamp(base[1]*k,0,255)|0},${clamp(base[2]*k,0,255)|0})`;
     x.fillRect(i,0,1,size);
-    const hv = Math.round(40 + trap*205);
+    const hv = Math.round(60 + prof*175);
     hx.fillStyle = `rgb(${hv},${hv},${hv})`; hx.fillRect(i,0,1,size);
   }
   // поперечные стыки листов
   for(let k=0;k<2;k++){
     const y = size*(0.5*k + 0.25);
-    x.fillStyle='rgba(58,52,46,.45)'; x.fillRect(0,y,size,2.5);
+    x.fillStyle='rgba(72,66,60,.3)'; x.fillRect(0,y,size,2);
     hx.fillStyle='rgba(30,30,30,.8)'; hx.fillRect(0,y,size,3);
   }
   // саморезы
@@ -331,45 +479,58 @@ function corrugatedMaps(size=512, rust=0.5, base=[118,112,104], ribs=7){
     const y = size*(0.5*k + 0.25) + 1;
     for(let i=0;i<ribs;i++){
       const px = (i+0.5)*size/ribs;
-      x.fillStyle='rgba(72,64,56,.75)'; x.beginPath(); x.arc(px,y,2.4,0,7); x.fill();
+      x.fillStyle='rgba(86,78,70,.5)'; x.beginPath(); x.arc(px,y,2.2,0,7); x.fill();
       hx.fillStyle='rgba(230,230,230,.9)'; hx.beginPath(); hx.arc(px,y,2.4,0,7); hx.fill();
     }
   }
-  for(let i=0;i<rust*320;i++){
+  for(let i=0;i<rust*240;i++){
     const px=srnd()*size, py=srnd()*size, r=sr(3,30);
-    const col = `rgba(${si(86,148)},${si(46,80)},${si(20,42)},${sr(.1,.5)})`;
+    const col = `rgba(${si(104,152)},${si(68,96)},${si(44,62)},${sr(.08,.34)})`;
     wrapDraw(x, size, ()=>{
       const g=x.createRadialGradient(px,py,1,px,py,r);
       g.addColorStop(0,col); g.addColorStop(1,'rgba(0,0,0,0)');
       x.fillStyle=g; x.beginPath(); x.arc(px,py,r,0,7); x.fill();
+    });
+    // ржавчина матовая: в roughness почти белая
+    wrapDraw(rx, size, ()=>{
+      const g=rx.createRadialGradient(px,py,1,px,py,r);
+      g.addColorStop(0,`rgba(240,240,240,${sr(.2,.6)})`); g.addColorStop(1,'rgba(240,240,240,0)');
+      rx.fillStyle=g; rx.beginPath(); rx.arc(px,py,r,0,7); rx.fill();
     });
   }
   // вертикальные потёки
   for(let i=0;i<22;i++){
     const px=srnd()*size, w=sr(2,9), y0=srnd()*size;
     const g=x.createLinearGradient(px,y0,px,y0+size*0.5);
-    g.addColorStop(0,`rgba(${si(78,120)},${si(44,66)},${si(24,38)},.32)`);
+    g.addColorStop(0,`rgba(${si(88,126)},${si(58,80)},${si(38,52)},.2)`);
     g.addColorStop(1,'rgba(0,0,0,0)');
     x.fillStyle=g; x.fillRect(px,y0,w,size*0.5);
   }
-  grain(x,size,size,0.03);
-  return {albedo:c, height:h};
+  grain(x,size,size,0.028);
+  return {albedo:c, height:h, rough:rg};
 }
 
 /* ---------- Ржавый крашеный металл (колонны, фермы) ---------- */
 function steelMaps(size=512, baseCol=[64,60,58]){
   const [c,x] = cv(size,size);
   const [h,hx] = cv(size,size);
+  const [rg,rx] = cv(size,size);
+  rx.fillStyle='#6e6e6e'; rx.fillRect(0,0,size,size);
   x.fillStyle=`rgb(${baseCol[0]},${baseCol[1]},${baseCol[2]})`; x.fillRect(0,0,size,size);
   hx.fillStyle='#b4b4b4'; hx.fillRect(0,0,size,size);
   // облезшая краска
   for(let i=0;i<420;i++){
     const px=srnd()*size, py=srnd()*size, r=sr(3,26);
-    const col=`rgba(${si(92,158)},${si(50,86)},${si(24,46)},${sr(.14,.6)})`;
+    const col=`rgba(${si(96,156)},${si(58,90)},${si(36,56)},${sr(.14,.58)})`;
     wrapDraw(x, size, ()=>{
       const g=x.createRadialGradient(px,py,1,px,py,r);
       g.addColorStop(0,col); g.addColorStop(1,'rgba(0,0,0,0)');
       x.fillStyle=g; x.beginPath(); x.arc(px,py,r,0,7); x.fill();
+    });
+    wrapDraw(rx, size, ()=>{
+      const g=rx.createRadialGradient(px,py,1,px,py,r);
+      g.addColorStop(0,`rgba(235,235,235,${sr(.25,.7)})`); g.addColorStop(1,'rgba(235,235,235,0)');
+      rx.fillStyle=g; rx.beginPath(); rx.arc(px,py,r,0,7); rx.fill();
     });
     wrapDraw(hx, size, ()=>{
       const hv=si(130,190);
@@ -385,16 +546,18 @@ function steelMaps(size=512, baseCol=[64,60,58]){
     g.addColorStop(1,'rgba(0,0,0,0)');
     x.fillStyle=g; x.fillRect(px,y0,w,size*0.6);
   }
-  grain(x,size,size,0.05);
-  return {albedo:c, height:h};
+  grain(x,size,size,0.045);
+  return {albedo:c, height:h, rough:rg};
 }
 
 /* ---------- Бетонная панель цоколя ---------- */
 function panelMaps(size=768){
   const [c,x] = cv(size,size);
   const [h,hx] = cv(size,size);
-  x.fillStyle='#8e8a82'; x.fillRect(0,0,size,size);
+  const [rg,rx] = cv(size,size);
+  x.fillStyle='#8a8884'; x.fillRect(0,0,size,size);
   hx.fillStyle='#b0b0b0'; hx.fillRect(0,0,size,size);
+  rx.fillStyle='#dcdcdc'; rx.fillRect(0,0,size,size);
   for(let i=0;i<420;i++){
     const v=si(112,162), px=srnd()*size, py=srnd()*size, r=sr(6,40);
     wrapDraw(x, size, ()=>{ x.fillStyle=`rgba(${v},${v-2},${v-8},${sr(.04,.16)})`;
@@ -426,8 +589,15 @@ function panelMaps(size=768){
   const gm = x.createLinearGradient(0,size*0.72,0,size);
   gm.addColorStop(0,'rgba(48,50,40,0)'); gm.addColorStop(1,'rgba(48,50,40,.38)');
   x.fillStyle=gm; x.fillRect(0,size*0.72,size,size*0.28);
-  grain(x,size,size,0.035);
-  return {albedo:c, height:h};
+  // мокрые подтёки — глянцевее сухого бетона
+  for(let i=0;i<20;i++){
+    const px=srnd()*size, w=sr(6,30);
+    const g=rx.createLinearGradient(px,0,px,size);
+    g.addColorStop(0,`rgba(120,120,120,${sr(.2,.45)})`); g.addColorStop(1,'rgba(120,120,120,0)');
+    rx.fillStyle=g; rx.fillRect(px,0,w,size);
+  }
+  grain(x,size,size,0.03);
+  return {albedo:c, height:h, rough:rg};
 }
 
 /* ---------- Граффити: крупные росписи во всю стену, как в референсе ---------- */
@@ -435,9 +605,10 @@ function graffitiTex(kind, w=512, h=512){
   const [c,x] = cv(w,h);
   x.clearRect(0,0,w,h);
   x.lineCap='round'; x.lineJoin='round';
+  // Выгоревшие, приглушённые пигменты: свежая яркая краска выглядит наклейкой.
   const pal = [
-    ['#8d2b24','#d8b03a','#2a2f4a'], ['#1f2b46','#7a2f6a','#cfd2d6'],
-    ['#2d2a26','#a8442c','#c9b68a'], ['#3a4f2c','#8d2b24','#d9d2c2']
+    ['#6e3630','#9a8244','#3b4152'], ['#33415c','#6b4560','#a8aaa8'],
+    ['#3c3832','#8a5340','#a89a7c'], ['#47523c','#7a4038','#b0aa9a']
   ][kind % 4];
   const A = pal[0], B = pal[1], C = pal[2];
 
@@ -623,50 +794,59 @@ function buildMaterials(){
   const mk = (maps, rep, normScale, opts={}) => {
     const albedo = T(maps.albedo, rep[0], rep[1]);
     const normal = T(heightToNormal(maps.height, opts.hStrength ?? 2.4), rep[0], rep[1], false);
+    // Карта шероховатости: без неё вся поверхность блестит одинаково и выглядит пластиком.
+    const roughMap = maps.rough ? T(maps.rough, rep[0], rep[1], false) : null;
+    // AO из карты высот: затемняет углубления (швы, стыки, каверны).
+    const aoMap = T(heightToAO(maps.height, opts.aoPower ?? 1.0), rep[0], rep[1], false);
     const mat = new THREE.MeshStandardMaterial({
       map: albedo, normalMap: normal,
       normalScale: new THREE.Vector2(normScale, normScale),
+      roughnessMap: roughMap,
+      aoMap, aoMapIntensity: opts.ao ?? 0.85,
       roughness: opts.rough ?? 0.92, metalness: opts.metal ?? 0.0,
       side: opts.side ?? THREE.FrontSide,
       envMapIntensity: opts.env ?? 0.55
     });
     return mat;
   };
-  MAPS.osb   = osbMaps(768, 1.0);
-  MAPS.osb2  = osbMaps(768, 0.9);
+  MAPS.osb   = osbMaps(1024, 1.0);
+  MAPS.osb2  = osbMaps(1024, 0.92);
   MAPS.conc  = concreteMaps(768);
   MAPS.wood  = lumberMaps(512);
   MAPS.corr  = corrugatedMaps(512, 0.45, [124,118,110], 7);
-  MAPS.roof  = corrugatedMaps(512, 0.8,  [96,82,70], 6);
-  MAPS.steel = steelMaps(512, [58,54,52]);
+  MAPS.roof  = corrugatedMaps(512, 0.62, [168,154,136], 6);
+  MAPS.steel = steelMaps(512, [112,106,98]);
   MAPS.panel = panelMaps(768);
 
-  M.osb   = mk(MAPS.osb , [1,1], 0.62, {rough:.93, hStrength:1.3});
-  M.osb2  = mk(MAPS.osb2, [1,1], 0.62, {rough:.94, hStrength:1.3});
-  M.conc  = mk(MAPS.conc, [1,1], 0.85, {rough:.96, env:.35});
-  M.wood  = mk(MAPS.wood, [1,1], 0.9 , {rough:.9});
-  M.corr  = mk(MAPS.corr, [1,1], 1.3 , {rough:.76, metal:.22, side:THREE.DoubleSide, env:.55});
-  M.roof  = mk(MAPS.roof, [1,1], 1.3 , {rough:.86, metal:.12, side:THREE.DoubleSide, env:.4});
-  M.steel = mk(MAPS.steel,[1,1], 1.0 , {rough:.78, metal:.4, env:.7});
-  M.panel = mk(MAPS.panel,[1,1], 1.0 , {rough:.95, env:.35});
+  // roughness берётся из карт; числовое значение работает множителем
+  M.osb   = mk(MAPS.osb , [1,1], 1.05, {rough:1.0, hStrength:2.2, ao:.95, env:.28});
+  M.osb2  = mk(MAPS.osb2, [1,1], 1.05, {rough:1.0, hStrength:2.2, ao:.95, env:.28});
+  M.conc  = mk(MAPS.conc, [1,1], 0.80, {rough:1.0, ao:.95, env:.22, aoPower:1.15});
+  M.wood  = mk(MAPS.wood, [1,1], 0.85, {rough:1.0, ao:.85, env:.28});
+  M.corr  = mk(MAPS.corr, [1,1], 1.20, {rough:1.0, metal:.25, side:THREE.DoubleSide, env:1.0, ao:.6});
+  M.roof  = mk(MAPS.roof, [1,1], 1.15, {rough:1.0, metal:.15, side:THREE.DoubleSide, env:1.0, ao:.55});
+  M.steel = mk(MAPS.steel,[1,1], 0.95, {rough:1.0, metal:.35, env:1.0, ao:.6});
+  M.panel = mk(MAPS.panel,[1,1], 0.95, {rough:1.0, ao:.95, env:.25, aoPower:1.1});
 
-  M.dark   = new THREE.MeshStandardMaterial({color:0x33302c, roughness:.72, metalness:.55, envMapIntensity:.8});
-  M.darker = new THREE.MeshStandardMaterial({color:0x22201e, roughness:.8, metalness:.45});
-  M.rubber = new THREE.MeshStandardMaterial({color:0x16171a, roughness:.96, metalness:.02});
-  M.plastO = new THREE.MeshStandardMaterial({color:0xc8501f, roughness:.55, metalness:.02});
-  M.plastB = new THREE.MeshStandardMaterial({color:0x2d4f84, roughness:.6, metalness:.02});
-  M.paintG = new THREE.MeshStandardMaterial({color:0x4d6647, roughness:.62, metalness:.2});
-  M.paintY = new THREE.MeshStandardMaterial({color:0xb9923a, roughness:.6, metalness:.25});
+  // Крашеный металл: приглушённые, выгоревшие цвета вместо ярких «пластиковых».
+  M.dark   = new THREE.MeshStandardMaterial({color:0x4a463f, roughness:.7, metalness:.3, envMapIntensity:1.1});
+  M.darker = new THREE.MeshStandardMaterial({color:0x262320, roughness:.78, metalness:.45});
+  M.rubber = new THREE.MeshStandardMaterial({color:0x1a1b1d, roughness:.94, metalness:.03});
+  M.plastO = new THREE.MeshStandardMaterial({color:0x9c5734, roughness:.66, metalness:.05});
+  M.plastB = new THREE.MeshStandardMaterial({color:0x3a5470, roughness:.66, metalness:.06});
+  M.paintG = new THREE.MeshStandardMaterial({color:0x4e5a46, roughness:.68, metalness:.22});
+  M.paintY = new THREE.MeshStandardMaterial({color:0xa88a4c, roughness:.66, metalness:.25});
   // Без transmission: он требует отдельного прохода рендера, стоит дорого и
   // на части драйверов роняет кадр в чёрный. Грязное стекло даёт тот же вид дешевле.
   M.glass  = new THREE.MeshStandardMaterial({
-    color:0xb9cddd, roughness:.42, metalness:0, side:THREE.DoubleSide,
-    transparent:true, opacity:.72, emissive:0xcdd9e6, emissiveIntensity:0.55,
+    color:0xc4cfd6, roughness:.46, metalness:0, side:THREE.DoubleSide,
+    transparent:true, opacity:.78, emissive:0xd8dee4, emissiveIntensity:0.42,
     map: T(dirtyGlassMaps(256), 1, 1)
   });
-  M.tarp   = new THREE.MeshStandardMaterial({color:0x3f4a52, roughness:.85, side:THREE.DoubleSide});
-  M.foam   = new THREE.MeshStandardMaterial({color:0xc9c2ae, roughness:.98});
-  M.cable  = new THREE.MeshStandardMaterial({color:0x1c1d20, roughness:.85});
+  M.tarp   = new THREE.MeshStandardMaterial({color:0x545a52, roughness:.92, side:THREE.DoubleSide});
+  M.foam   = new THREE.MeshStandardMaterial({color:0xbdb6a4, roughness:.97});
+  M.cable  = new THREE.MeshStandardMaterial({color:0x222326, roughness:.82});
+  M.dirt   = new THREE.MeshStandardMaterial({color:0x6a6154, roughness:.98});
 }
 
 /* ============================================================================
@@ -688,6 +868,15 @@ function uvBox(g, sx,sy,sz, d){
   }
   uv.needsUpdate = true;
 }
+/** Подмешивает в геометрию вершинный цвет: каждый лист обшивки получает
+    свой оттенок, иначе стена выглядит как один плоский залив. */
+function tintGeo(g, r, gg, b){
+  const n = g.attributes.position.count;
+  const col = new Float32Array(n*3);
+  for(let i=0;i<n;i++){ col[i*3]=r; col[i*3+1]=gg; col[i*3+2]=b; }
+  g.setAttribute('color', new THREE.BufferAttribute(col,3));
+  return g;
+}
 function addBox(mat, cx,cy,cz, sx,sy,sz, o={}){
   const g = new THREE.BoxGeometry(sx,sy,sz);
   uvBox(g, sx,sy,sz, o.d ?? 0.5);
@@ -696,6 +885,7 @@ function addBox(mat, cx,cy,cz, sx,sy,sz, o={}){
   } else _q.identity();
   _m4.compose(new THREE.Vector3(cx,cy,cz), _q, new THREE.Vector3(1,1,1));
   g.applyMatrix4(_m4);
+  if(o.tint) tintGeo(g, o.tint[0], o.tint[1], o.tint[2]);
   bucket(mat).push(g);
   if(o.collide !== false) addAABB(cx,cy,cz,sx,sy,sz,o.rotY||0);
   return g;
@@ -709,6 +899,11 @@ function addAABB(cx,cy,cz,sx,sy,sz,rotY=0){
 function flushBuckets(){
   for(const [k, arr] of BUCKET){
     if(!arr.length) continue;
+    // мердж требует одинаковый набор атрибутов: дополняем белым там, где цвета нет
+    if(arr.some(g=>g.attributes.color)){
+      for(const g of arr) if(!g.attributes.color) tintGeo(g,1,1,1);
+      if(M[k]) M[k].vertexColors = true;
+    }
     const merged = BGU.mergeGeometries(arr, false);
     merged.computeBoundingSphere();
     const mesh = new THREE.Mesh(merged, M[k]);
@@ -738,8 +933,17 @@ function buildHangar(){
     const g = new THREE.PlaneGeometry(x1-x0, z1-z0);
     g.rotateX(-Math.PI/2); g.translate((x0+x1)/2, 0, (z0+z1)/2);
     const uv = g.attributes.uv;
-    for(let k=0;k<uv.count;k++) uv.setXY(k, uv.getX(k)*(x1-x0)*0.5 + i*0.37, uv.getY(k)*(z1-z0)*0.5 + j*0.29);
+    // Случайный сдвиг И поворот UV на плиту: одинаковый тайл перестаёт читаться.
+    const rot = Math.floor(srnd()*4)*Math.PI/2, cs=Math.cos(rot), sn=Math.sin(rot);
+    const ou = srnd()*7, ov = srnd()*7;
+    for(let k=0;k<uv.count;k++){
+      const u0 = uv.getX(k)*(x1-x0)*0.42, v0 = uv.getY(k)*(z1-z0)*0.42;
+      uv.setXY(k, u0*cs - v0*sn + ou, u0*sn + v0*cs + ov);
+    }
     tiles.push(g);
+    // деформационный шов по краю плиты
+    if(x1 < HW-0.01) addBox('darker', x1, 0.004, (z0+z1)/2, 0.035, 0.03, z1-z0, {collide:false, d:1});
+    if(z1 < HD-0.01) addBox('darker', (x0+x1)/2, 0.004, z1, x1-x0, 0.03, 0.035, {collide:false, d:1});
   }
   const floor = new THREE.Mesh(BGU.mergeGeometries(tiles,false), M.conc);
   floor.receiveShadow = true; floor.name='floor';
@@ -941,7 +1145,7 @@ function buildLamps(){
       // корпус + отражатель
       addBox('dark', x, y+0.12, z, 1.85, 0.11, 0.30, {collide:false, d:1.4});
       const tube = new THREE.Mesh(new THREE.CylinderGeometry(0.048,0.048,1.72,8),
-        new THREE.MeshBasicMaterial({color:0xf0f6ff}));
+        new THREE.MeshBasicMaterial({color:0xf4f2ea}));
       tube.rotation.z = Math.PI/2; tube.position.set(x, y, z);
       scene.add(tube);
       // подвесы
@@ -1055,10 +1259,14 @@ function buildWall(x1,z1,x2,z2, y0,h, opt={}){
         if(ltW < 0.05 || lhH < 0.05) continue;
         const lyc = y0 + ly0 + lhH/2;
         const [cx,cy,cz]=P(lt0+ltW/2,nOff,lyc);
-        const g=new THREE.BoxGeometry(SHEET,lhH,ltW); uvBox(g,SHEET,lhH,ltW,1.05);
+        const g=new THREE.BoxGeometry(SHEET,lhH,ltW); uvBox(g,SHEET,lhH,ltW,0.82);
         _e.set(0,ang,0); _q.setFromEuler(_e);
         _m4.compose(new THREE.Vector3(cx,cy,cz),_q,new THREE.Vector3(1,1,1));
-        g.applyMatrix4(_m4); bucket(srnd()<0.5?'osb':'osb2').push(g);
+        g.applyMatrix4(_m4);
+        // партии ОСП отличаются: одни листы светлее, другие серее и темнее
+        const t0c = sr(0.80, 1.06), warmv = sr(0.94, 1.03);
+        tintGeo(g, t0c*warmv, t0c*sr(0.97,1.01), t0c*sr(0.90,1.0));
+        bucket(srnd()<0.5?'osb':'osb2').push(g);
         if(ltW>1.0 && lhH>1.6) DECORSPOTS.push({x:cx+nx*s*0.02, y:lyc, z:cz+nz*s*0.02,
                                              rotY:Math.atan2(nx*s,nz*s), w:ltW, h:lhH, f:y0>2?2:1});
       }
@@ -1075,7 +1283,7 @@ function buildWall(x1,z1,x2,z2, y0,h, opt={}){
 function deck(x0,z0,x1,z1, y=F2, opt={}){
   const sx=x1-x0, sz=z1-z0, cx=(x0+x1)/2, cz=(z0+z1)/2;
   if(sx<0.05||sz<0.05) return;
-  addBox('osb', cx, y+DECK_T/2, cz, sx, DECK_T, sz, {d:.85});
+  addBox('osb', cx, y+DECK_T/2, cz, sx, DECK_T, sz, {d:.85, tint:[0.88,0.87,0.83]});
   const n = Math.max(2, Math.round(sx/STEP));
   for(let i=0;i<=n;i++){
     addBox('wood', x0+i*sx/n, y-0.14, cz, 0.075, 0.28, sz, {collide:false, d:.9});
@@ -1289,10 +1497,10 @@ const FILLS=[], LIGHT_POOL=[], SHAFTS=[];
 let sunTarget;
 
 function buildLights(){
-  hemi = new THREE.HemisphereLight(0xc6d2dc, 0x6b5a46, 0.72); scene.add(hemi);
-  ambient = new THREE.AmbientLight(0xf0e4cf, 0.46); scene.add(ambient);
+  hemi = new THREE.HemisphereLight(0x9ab4d0, 0x7d7264, 0.62); scene.add(hemi);
+  ambient = new THREE.AmbientLight(0xdfe3e6, 0.16); scene.add(ambient);
 
-  sun = new THREE.DirectionalLight(0xffedd0, 4.6);
+  sun = new THREE.DirectionalLight(0xfff2dc, 5.4);
   sun.position.set(-34, 40, 22);
   sunTarget = new THREE.Object3D(); sunTarget.position.set(2,0,-4); scene.add(sunTarget);
   sun.target = sunTarget;
@@ -1304,16 +1512,16 @@ function buildLights(){
   scene.add(sun);
 
   // мягкие заполняющие от остекления (без теней — дёшево)
-  const f1 = new THREE.DirectionalLight(0xd3ddea, 0.72); f1.position.set(30,14,-26); scene.add(f1);
-  const f2 = new THREE.DirectionalLight(0xc8d0dc, 0.52); f2.position.set(-30,13,26); scene.add(f2);
-  const f3 = new THREE.DirectionalLight(0xf2e2c6, 0.52); f3.position.set(6,24,2);   scene.add(f3);
+  const f1 = new THREE.DirectionalLight(0xc6d4e6, 0.5); f1.position.set(30,14,-26); scene.add(f1);
+  const f2 = new THREE.DirectionalLight(0xbcc8d8, 0.34); f2.position.set(-30,13,26); scene.add(f2);
+  const f3 = new THREE.DirectionalLight(0xe8e2d4, 0.28); f3.position.set(6,24,2);   scene.add(f3);
   // отражённый от бетонного пола свет — иначе низ кровли и фермы уходят в смолу
-  const bounce = new THREE.DirectionalLight(0xdccbb0, 0.55);
+  const bounce = new THREE.DirectionalLight(0xd4cbba, 0.55);
   bounce.position.set(0,-20,0); scene.add(bounce);
   FILLS.push(f1,f2,f3,bounce);
 
   for(let i=0;i<6;i++){
-    const L = new THREE.PointLight(0xcfe0f6, 0, 16, 2);
+    const L = new THREE.PointLight(0xe6e4dc, 0, 16, 2);
     L.position.set(0,-60,0); scene.add(L); LIGHT_POOL.push(L);
   }
 }
@@ -1436,16 +1644,18 @@ function updateLightPool(pos){
 function setNight(on){
   NIGHT = on;
   sun.intensity = on ? 0.06 : 4.6;
-  hemi.intensity = on ? 0.09 : 0.72;
+  hemi.intensity = on ? 0.12 : 0.62;
   ambient.intensity = on ? 0.05 : 0.20;
-  FILLS.forEach((f,i)=> f.intensity = on ? 0.03 : [0.72,0.52,0.52,0.55][i]);
+  FILLS.forEach((f,i)=> f.intensity = on ? 0.03 : [0.5,0.34,0.28,0.55][i]);
   for(const s of SHAFTS) s.visible = !on;
   if(dust) dust.material.uniforms.uOpacity.value = on ? 0.10 : 0.42;
-  scene.fog.color.set(on ? 0x05070c : 0x8a8272);
-  scene.fog.density = on ? 0.014 : 0.0062;
-  scene.background = new THREE.Color(on ? 0x04050a : 0x11100e);
-  M.glass.color.set(on ? 0x2b3a52 : 0xdce8f2);
-  renderer.toneMappingExposure = on ? 1.30 : 1.18;
+  scene.fog.color.set(on ? 0x05070c : 0x9aa0a6);
+  if(SKY) SKY.material.color.set(on ? 0x0c1220 : 0xffffff);
+  scene.fog.density = on ? 0.014 : 0.0048;
+  scene.background = new THREE.Color(on ? 0x04050a : 0x14151a);
+  M.glass.color.set(on ? 0x2b3a52 : 0xc4cfd6);
+  scene.environmentIntensity = on ? 0.12 : 1.0;
+  renderer.toneMappingExposure = on ? 1.30 : 1.02;
 }
 
 /* ============================================================================
@@ -1667,6 +1877,238 @@ function sandbags(x,y,z,rotY,rows=3,len=4){
   addAABB(x, y+rows*0.26/2, z, len*0.42, rows*0.26, 0.5, rotY);
 }
 
+
+/* ---------- Строительные леса: главный вертикальный объект недостроя ---------- */
+function scaffold(x,y,z,rotY,bays=2,levels=2){
+  y = snapSupport(x,z,y); if(y === null) return;
+  const BW=1.9, BD=1.15, LH=1.95;
+  for(let b=0;b<=bays;b++){
+    for(const sd of [-1,1]){
+      const ox = -bays*BW/2 + b*BW, oz = sd*BD/2;
+      const px = x + Math.cos(rotY)*ox - Math.sin(rotY)*oz;
+      const pz = z - Math.sin(rotY)*ox - Math.cos(rotY)*oz;
+      addBox('steel', px, y+levels*LH/2, pz, 0.055, levels*LH, 0.055, {collide:false, d:1.2});
+    }
+  }
+  for(let l=1;l<=levels;l++){
+    const ly = y + l*LH;
+    // ригели вдоль и поперёк
+    addBox('steel', x, ly, z, bays*BW, 0.05, 0.05, {rotY, collide:false, d:1.2});
+    for(const sd of [-1,1]){
+      const oz = sd*BD/2;
+      addBox('steel', x - Math.sin(rotY)*oz, ly-0.02, z - Math.cos(rotY)*oz,
+             bays*BW, 0.05, 0.05, {rotY, collide:false, d:1.2});
+    }
+    // настил из досок
+    for(let d=0;d<4;d++){
+      const oz = -BD/2 + 0.16 + d*0.28;
+      addBox('wood', x - Math.sin(rotY)*oz, ly+0.06, z - Math.cos(rotY)*oz,
+             bays*BW-0.1, 0.035, 0.26, {rotY, collide:false, d:1.1});
+    }
+    addAABB(x, ly+0.05, z, bays*BW, 0.12, BD, rotY);
+    // диагональные раскосы
+    for(let b=0;b<bays;b++){
+      const ox = -bays*BW/2 + b*BW + BW/2;
+      const len = Math.hypot(BW, LH);
+      const g = new THREE.BoxGeometry(len, 0.04, 0.04);
+      g.rotateZ(Math.atan2(LH, BW) * (b%2?1:-1));
+      _e.set(0,rotY,0); _q.setFromEuler(_e);
+      const px = x + Math.cos(rotY)*ox, pz = z - Math.sin(rotY)*ox;
+      _m4.compose(new THREE.Vector3(px, ly-LH/2, pz + (rotY?0:BD/2)), _q, new THREE.Vector3(1,1,1));
+      g.applyMatrix4(_m4); bucket('steel').push(g);
+    }
+  }
+}
+/* ---------- Тачка ---------- */
+function wheelbarrow(x,y,z,rotY){
+  y = snapSupport(x,z,y); if(y === null) return;
+  const g = new THREE.Group();
+  const tub = new THREE.Mesh(new THREE.BoxGeometry(0.72,0.26,0.54), M.paintY);
+  tub.position.set(0,0.46,0); tub.rotation.z = 0.08;
+  const front = new THREE.Mesh(new THREE.BoxGeometry(0.06,0.3,0.5), M.paintY);
+  front.position.set(0.36,0.52,0);
+  g.add(tub, front);
+  const wheel = new THREE.Mesh(new THREE.TorusGeometry(0.17,0.055,8,14), M.rubber);
+  wheel.position.set(0.44,0.17,0); wheel.rotation.y = Math.PI/2; g.add(wheel);
+  for(const sd of [-1,1]){
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.04,0.34,0.04), M.steel);
+    leg.position.set(-0.24,0.17,sd*0.22); g.add(leg);
+    const handle = new THREE.Mesh(new THREE.BoxGeometry(1.05,0.045,0.045), M.steel);
+    handle.position.set(-0.22,0.44,sd*0.24); handle.rotation.z = -0.1; g.add(handle);
+  }
+  g.position.set(x,y,z); g.rotation.y = rotY;
+  g.traverse(o=>{ o.castShadow=true; o.receiveShadow=true; });
+  scene.add(g); SHOOTABLE.push(g);
+  COLLIDERS.push({x0:x-0.7,y0:y,z0:z-0.5,x1:x+0.7,y1:y+0.7,z1:z+0.5});
+}
+/* ---------- Бетономешалка ---------- */
+function mixer(x,y,z,rotY){
+  y = snapSupport(x,z,y); if(y === null) return;
+  const g = new THREE.Group();
+  const drum = new THREE.Mesh(new THREE.CylinderGeometry(0.42,0.30,0.62,16), M.paintY);
+  drum.position.set(0,0.92,0); drum.rotation.z = 0.5; g.add(drum);
+  const mouth = new THREE.Mesh(new THREE.CylinderGeometry(0.30,0.30,0.05,16), M.darker);
+  mouth.position.set(0.24,1.17,0); mouth.rotation.z = 0.5; g.add(mouth);
+  const frame = new THREE.Mesh(new THREE.BoxGeometry(0.62,0.08,0.5), M.steel);
+  frame.position.set(0,0.52,0); g.add(frame);
+  for(const sx of [-1,1]) for(const sz of [-1,1]){
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.05,0.52,0.05), M.steel);
+    leg.position.set(sx*0.26,0.26,sz*0.2); g.add(leg);
+  }
+  for(const sd of [-1,1]){
+    const w = new THREE.Mesh(new THREE.TorusGeometry(0.14,0.05,7,12), M.rubber);
+    w.position.set(-0.3,0.14,sd*0.22); w.rotation.y=Math.PI/2; g.add(w);
+  }
+  g.position.set(x,y,z); g.rotation.y=rotY;
+  g.traverse(o=>{ o.castShadow=true; o.receiveShadow=true; });
+  scene.add(g); SHOOTABLE.push(g);
+  COLLIDERS.push({x0:x-0.55,y0:y,z0:z-0.45,x1:x+0.55,y1:y+1.3,z1:z+0.45});
+}
+/* ---------- Связки арматуры ---------- */
+function rebar(x,y,z,rotY,n=14,len=4.0){
+  y = snapSupport(x,z,y); if(y === null) return;
+  const parts=[];
+  for(let i=0;i<n;i++){
+    const r = new THREE.CylinderGeometry(0.009,0.009,len,5);
+    r.rotateZ(Math.PI/2);
+    r.translate(sr(-0.06,0.06), 0.05 + Math.floor(i/5)*0.022, -0.16 + (i%5)*0.08);
+    parts.push(r);
+  }
+  const m = new THREE.Mesh(BGU.mergeGeometries(parts,false), M.steel);
+  m.position.set(x,y,z); m.rotation.y=rotY;
+  m.castShadow=true; m.receiveShadow=true; scene.add(m); SHOOTABLE.push(m);
+  addAABB(x, y+0.06, z, len, 0.14, 0.5, rotY);
+}
+/* ---------- Рулоны утеплителя ---------- */
+function insulation(x,y,z,rotY,n=3){
+  y = snapSupport(x,z,y); if(y === null) return;
+  for(let i=0;i<n;i++){
+    const r = new THREE.Mesh(new THREE.CylinderGeometry(0.29,0.29,1.05,14),
+      new THREE.MeshStandardMaterial({color: i%2?0xc9b48a:0xb8a884, roughness:.97}));
+    r.rotation.z = Math.PI/2;
+    r.position.set(x + Math.cos(rotY)*sr(-0.1,0.1), y+0.29+Math.floor(i/2)*0.56,
+                   z - Math.sin(rotY)*(-0.3+ (i%2)*0.6));
+    r.rotation.y = rotY;
+    r.castShadow=true; r.receiveShadow=true; scene.add(r); SHOOTABLE.push(r);
+  }
+  addAABB(x, y+0.3, z, 1.15, 0.6*Math.ceil(n/2), 1.3, rotY);
+}
+/* ---------- Верстак с инструментом ---------- */
+function workbench(x,y,z,rotY){
+  y = snapSupport(x,z,y); if(y === null) return;
+  addBox('wood', x, y+0.86, z, 2.0, 0.07, 0.72, {rotY, d:1.0});
+  addBox('wood', x, y+0.42, z, 1.9, 0.04, 0.6, {rotY, collide:false, d:1.0});
+  for(const sx of [-0.88,0.88]) for(const sz of [-0.3,0.3]){
+    const px = x + Math.cos(rotY)*sx - Math.sin(rotY)*sz;
+    const pz = z - Math.sin(rotY)*sx - Math.cos(rotY)*sz;
+    addBox('wood', px, y+0.43, pz, 0.08, 0.86, 0.08, {collide:false, d:1.0});
+  }
+  // тиски и ящик с инструментом
+  const vise = new THREE.Mesh(new THREE.BoxGeometry(0.2,0.16,0.14), M.steel);
+  vise.position.set(x + Math.cos(rotY)*0.7, y+0.97, z - Math.sin(rotY)*0.7);
+  vise.rotation.y = rotY; vise.castShadow=true; scene.add(vise);
+  const tbox = new THREE.Mesh(new THREE.BoxGeometry(0.42,0.2,0.24), M.plastO);
+  tbox.position.set(x - Math.cos(rotY)*0.5, y+1.0, z + Math.sin(rotY)*0.5);
+  tbox.rotation.y = rotY + 0.2; tbox.castShadow=true; scene.add(tbox);
+}
+/* ---------- Свисающая плёнка / тент ---------- */
+function hangingTarp(x,y,z,rotY,w=2.2,h=2.6){
+  const seg = 10;
+  const g = new THREE.PlaneGeometry(w, h, seg, 6);
+  const pos = g.attributes.position;
+  for(let i=0;i<pos.count;i++){
+    const u = (pos.getX(i)/w + 0.5), v = (pos.getY(i)/h + 0.5);
+    // провис и складки: сверху закреплено, снизу свободно
+    pos.setZ(i, Math.sin(u*Math.PI*3.2)*0.10*(1-v) + Math.sin(v*4.0)*0.04);
+    pos.setX(i, pos.getX(i)*(1 - 0.06*(1-v)));
+  }
+  g.computeVertexNormals();
+  const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+    color:0xbcc2c0, roughness:.82, metalness:0, side:THREE.DoubleSide,
+    transparent:true, opacity:.55 }));
+  m.position.set(x,y,z); m.rotation.y = rotY;
+  m.castShadow = true; scene.add(m);
+}
+/* ---------- Электрощит ---------- */
+function panelBox(x,y,z,rotY){
+  addBox('dark', x, y, z, 0.12, 0.62, 0.44, {rotY, collide:false, d:1.2});
+  const door = new THREE.Mesh(new THREE.BoxGeometry(0.03,0.56,0.40), M.paintG);
+  door.position.set(x + Math.cos(rotY)*0.08, y, z - Math.sin(rotY)*0.08);
+  door.rotation.y = rotY; door.castShadow=true; scene.add(door);
+  // гофра вниз
+  const curve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(x, y-0.32, z),
+    new THREE.Vector3(x+sr(-0.1,0.1), y-1.1, z+sr(-0.08,0.08)),
+    new THREE.Vector3(x+sr(-0.15,0.15), y-1.9, z+sr(-0.1,0.1))
+  ]);
+  const tube = new THREE.Mesh(new THREE.TubeGeometry(curve,10,0.022,6,false), M.cable);
+  tube.castShadow=true; scene.add(tube);
+}
+/* ---------- Огнетушитель ---------- */
+function extinguisher(x,y,z,rotY){
+  y = snapSupport(x,z,y); if(y === null) return;
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.083,0.083,0.42,12),
+    new THREE.MeshStandardMaterial({color:0x8e3026, roughness:.5, metalness:.25}));
+  body.position.y = 0.24;
+  const top = new THREE.Mesh(new THREE.SphereGeometry(0.083,10,6), body.material);
+  top.position.y = 0.45; top.scale.y = 0.55;
+  const valve = new THREE.Mesh(new THREE.CylinderGeometry(0.02,0.02,0.09,8), M.steel);
+  valve.position.y = 0.53;
+  g.add(body, top, valve);
+  g.position.set(x,y,z); g.rotation.y = rotY;
+  g.traverse(o=>o.castShadow=true); scene.add(g); SHOOTABLE.push(g);
+}
+/* ---------- Куча мусора / обрезков ---------- */
+function debrisPile(x,y,z,r=0.9){
+  y = snapSupport(x,z,y); if(y === null) return;
+  const parts=[];
+  for(let i=0;i<26;i++){
+    const a=sr(0,6.28), d=sr(0,r);
+    const g = new THREE.BoxGeometry(sr(0.1,0.55), sr(0.02,0.06), sr(0.05,0.2));
+    _e.set(sr(-0.3,0.3), sr(0,6.28), sr(-0.25,0.25)); _q.setFromEuler(_e);
+    _m4.compose(new THREE.Vector3(Math.cos(a)*d, 0.03+sr(0,0.14), Math.sin(a)*d), _q, new THREE.Vector3(1,1,1));
+    g.applyMatrix4(_m4); parts.push(g);
+  }
+  const m = new THREE.Mesh(BGU.mergeGeometries(parts,false), M.wood);
+  m.position.set(x,y,z); m.castShadow=true; m.receiveShadow=true;
+  scene.add(m); SHOOTABLE.push(m);
+}
+/* ---------- Кирпичный поддон ---------- */
+function bricks(x,y,z,rotY,rows=5){
+  y = snapSupport(x,z,y); if(y === null) return;
+  pallet(x,y,z,rotY,1);
+  const bm = new THREE.MeshStandardMaterial({color:0x8a5f4a, roughness:.92});
+  const parts=[];
+  for(let r=0;r<rows;r++) for(let i=0;i<5;i++) for(let j=0;j<3;j++){
+    const g = new THREE.BoxGeometry(0.22,0.065,0.105);
+    const off = r%2 ? 0.11 : 0;
+    g.translate(-0.44+i*0.23+off, 0.17+r*0.07, -0.22+j*0.22);
+    parts.push(g);
+  }
+  const m = new THREE.Mesh(BGU.mergeGeometries(parts,false), bm);
+  m.position.set(x,y,z); m.rotation.y=rotY;
+  m.castShadow=true; m.receiveShadow=true; scene.add(m); SHOOTABLE.push(m);
+  addAABB(x, y+0.3, z, 1.2, 0.55, 0.8, rotY);
+}
+/* ---------- Оконная рама, прислонённая к стене ---------- */
+function windowFrame(x,y,z,rotY,tilt=0.18){
+  y = snapSupport(x,z,y); if(y === null) return;
+  const g = new THREE.Group();
+  const W=1.0,H=1.35;
+  for(const [sx,sy,w,h] of [[0,H/2,W,0.06],[0,-H/2,W,0.06],[-W/2,0,0.06,H],[W/2,0,0.06,H],[0,0,W,0.05]]){
+    const b = new THREE.Mesh(new THREE.BoxGeometry(w,h,0.055), M.wood);
+    b.position.set(sx,sy,0); g.add(b);
+  }
+  const gl = new THREE.Mesh(new THREE.PlaneGeometry(W-0.1,H-0.1), M.glass);
+  gl.position.z = 0.01; g.add(gl);
+  g.position.set(x, y+H/2*Math.cos(tilt), z);
+  g.rotation.set(0, rotY, 0); g.rotateX(tilt);
+  g.traverse(o=>{ o.castShadow=true; o.receiveShadow=true; });
+  scene.add(g);
+  COLLIDERS.push({x0:x-0.6,y0:y,z0:z-0.6,x1:x+0.6,y1:y+1.3,z1:z+0.6});
+}
+
 /* --- Размещение реквизита: плотно, но с проходами --- */
 function buildProps(){
   const Y2 = F2+DECK_T;
@@ -1779,15 +2221,73 @@ function buildProps(){
 }
 
 /* --- Декали: граффити, плакаты, пятна --- */
+function buildExtraProps(){
+  const Y2 = F2+DECK_T;
+
+  // Строительные леса — вертикальные ориентиры и лазалки
+  scaffold(-21.0, 0, -2.0, Math.PI/2, 2, 2);
+  scaffold( 21.6, 0,  4.5, Math.PI/2, 2, 2);
+  scaffold( -2.0, 0, -15.6, 0, 3, 1);
+  scaffold( 12.0, 0,  15.4, 0, 2, 2);
+  scaffold(  0.0, Y2, -11.6, 0, 2, 1);
+
+  // Техника и инвентарь стройки
+  mixer(-20.2, 0, 11.6, 0.4);
+  mixer( 22.4, 0, -13.6, -0.6);
+  wheelbarrow(-16.0, 0, 13.4, 0.9);
+  wheelbarrow( 3.2, 0, -13.2, -0.4);
+  wheelbarrow(-10.5, Y2, -4.0, 1.3);
+  workbench(-22.6, 0, 7.4, Math.PI/2);
+  workbench( 13.0, 0, -14.6, 0);
+  workbench( -6.0, Y2, 8.6, 0.1);
+
+  // Материалы
+  rebar(-19.0, 0, 6.4, 0.08, 16, 4.4);
+  rebar( 20.0, 0, 0.6, Math.PI/2+0.05, 12, 3.6);
+  rebar( -4.0, Y2, -8.0, 0.03, 10, 3.0);
+  bricks(-14.0, 0, -13.6, 0.1, 5);
+  bricks( 8.0, 0, 16.2, -0.15, 4);
+  bricks(-19.5, Y2, 2.6, 0.2, 3);
+  insulation(-24.2, 0, -0.5, Math.PI/2, 4);
+  insulation( 6.5, 0, -15.0, 0.1, 3);
+  insulation(-13.0, Y2, 5.2, 0.05, 2);
+  debrisPile(-12.0, 0, 3.2, 1.0);
+  debrisPile( 11.0, 0, 6.6, 0.8);
+  debrisPile(-16.5, Y2, -1.5, 0.9);
+  debrisPile( 15.5, Y2, 6.0, 0.7);
+  debrisPile( 2.0, 0, 9.0, 1.1);
+  windowFrame(-18.2, 0, 8.6, 1.1, 0.2);
+  windowFrame( 17.0, 0, 12.2, -0.7, 0.22);
+  windowFrame( -9.0, Y2, -1.2, 0.5, 0.18);
+
+  // Плёнка на проёмах: качается на сквозняке, ломает прямые линии
+  hangingTarp(-11.0, 1.05, -2.1, 0, 1.9, 2.05);
+  hangingTarp( 5.5, 1.05, 6.8, Math.PI/2, 1.7, 2.0);
+  hangingTarp(-8.0, Y2+1.0, 2.1, 0, 1.8, 2.0);
+  hangingTarp( 14.5, Y2+1.0, -6.0, Math.PI/2, 1.6, 1.9);
+  hangingTarp(-24.0, 3.4, 5.0, Math.PI/2, 3.0, 4.2);
+
+  // Электрощиты и огнетушители на стенах ангара
+  panelBox(-26.6, 1.9, -4.0, Math.PI/2);
+  panelBox( 26.6, 1.9, 6.0, -Math.PI/2);
+  panelBox(-26.6, 1.9, 12.0, Math.PI/2);
+  extinguisher(-26.2, 0, -6.2, 0);
+  extinguisher( 26.2, 0, 3.4, 0);
+  extinguisher(-17.4, 0, -6.0, 0);
+  extinguisher( 6.0, Y2, -2.4, 0);
+}
+
 function buildDecals(){
   const grafMats = [];
-  for(let i=0;i<8;i++) grafMats.push(new THREE.MeshBasicMaterial({
-    map: graffitiTex(i), transparent:true, depthWrite:false, opacity:0.88,
+  for(let i=0;i<8;i++) grafMats.push(new THREE.MeshStandardMaterial({
+    map: graffitiTex(i), transparent:true, depthWrite:false, opacity:0.62,
+    roughness:0.95, metalness:0, side:THREE.FrontSide,
     polygonOffset:true, polygonOffsetFactor:-4, polygonOffsetUnits:-4
   }));
   const posterMats = [];
-  for(let i=0;i<3;i++) posterMats.push(new THREE.MeshBasicMaterial({
-    map: posterTex(i), transparent:true, depthWrite:false, opacity:0.92,
+  for(let i=0;i<3;i++) posterMats.push(new THREE.MeshStandardMaterial({
+    map: posterTex(i), transparent:true, depthWrite:false, opacity:0.85,
+    roughness:0.92, metalness:0,
     polygonOffset:true, polygonOffsetFactor:-4, polygonOffsetUnits:-4
   }));
 
@@ -1837,8 +2337,9 @@ function buildDecals(){
   POSTER_COUNT = pp;
   // пятна на полу обоих этажей
   const stainMats = [];
-  for(let i=0;i<4;i++) stainMats.push(new THREE.MeshBasicMaterial({
-    map: stainTex(), transparent:true, depthWrite:false, opacity:0.75,
+  for(let i=0;i<4;i++) stainMats.push(new THREE.MeshStandardMaterial({
+    map: stainTex(), transparent:true, depthWrite:false, opacity:0.6,
+    roughness:0.9, metalness:0,
     polygonOffset:true, polygonOffsetFactor:-3, polygonOffsetUnits:-3
   }));
   for(let i=0;i<46;i++){
@@ -2040,31 +2541,57 @@ function update(dt){
 ============================================================================ */
 const GradeShader = {
   uniforms:{
-    tDiffuse:{value:null}, uVig:{value:0.22}, uSat:{value:1.05},
-    uLift:{value:new THREE.Color(0.030,0.030,0.036)}, uGamma:{value:0.96}
+    tDiffuse:{value:null}, uVig:{value:0.18}, uSat:{value:0.99},
+    uShadowTint:{value:new THREE.Color(0.70,0.78,0.96)},   // холодные тени
+    uHighTint:{value:new THREE.Color(1.06,1.00,0.90)},     // тёплые света
+    uLift:{value:0.016}, uContrast:{value:1.12}, uTemp:{value:0.0}
   },
   vertexShader:`varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);} `,
   fragmentShader:`
-    uniform sampler2D tDiffuse; uniform float uVig,uSat,uGamma; uniform vec3 uLift;
+    uniform sampler2D tDiffuse;
+    uniform float uVig,uSat,uLift,uContrast,uTemp;
+    uniform vec3 uShadowTint, uHighTint;
     varying vec2 vUv;
     void main(){
       vec4 c = texture2D(tDiffuse, vUv);
-      // лёгкий подъём теней — «плёночный» чёрный вместо провала в ноль
-      c.rgb = c.rgb + uLift*(1.0 - c.rgb);
-      float l = dot(c.rgb, vec3(0.2126,0.7152,0.0722));
-      c.rgb = mix(vec3(l), c.rgb, uSat);
-      c.rgb = pow(max(c.rgb, 0.0), vec3(uGamma));
-      // мягкая широкая виньетка (не «объектив», просто спад к краям)
+      vec3 col = max(c.rgb, 0.0);
+
+      // подъём чёрного: «плёночный» чёрный вместо провала в ноль
+      col = col + uLift*(1.0 - col);
+
+      // S-кривая контраста вокруг средней точки
+      col = clamp((col - 0.5)*uContrast + 0.5, 0.0, 1.0);
+
+      // Раздельная тонировка с сохранением яркости: тени холоднее, света теплее,
+      // но общая экспозиция не падает (иначе картинка уходит в мутную оливку).
+      float l = dot(col, vec3(0.2126,0.7152,0.0722));
+      vec3 tint = mix(uShadowTint, uHighTint, smoothstep(0.06, 0.70, l));
+      tint /= max(dot(tint, vec3(0.2126,0.7152,0.0722)), 1e-4);
+      col *= mix(vec3(1.0), tint, 0.30);
+
+      col = mix(vec3(dot(col, vec3(0.2126,0.7152,0.0722))), col, uSat);
+
+      // мягкая широкая виньетка
       vec2 d = vUv - 0.5;
-      float v = 1.0 - uVig*dot(d,d)*1.9;
-      c.rgb *= clamp(v, 0.0, 1.0);
-      gl_FragColor = c;
+      col *= clamp(1.0 - uVig*dot(d,d)*1.9, 0.0, 1.0);
+
+      gl_FragColor = vec4(col, c.a);
     }`
 };
-let composer, bloomPass, gradePass, smaaPass;
+let composer, bloomPass, gradePass, smaaPass, aoPass;
 function buildComposer(){
   composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
+  // Ambient occlusion: без контактных теней стыки стен/пола выглядят плоско
+  aoPass = new GTAOPass(scene, camera, innerWidth, innerHeight);
+  aoPass.output = GTAOPass.OUTPUT.Default;
+  aoPass.updateGtaoMaterial({
+    radius: 0.42, distanceExponent: 1.6, thickness: 0.6,
+    scale: 1.1, samples: 16, screenSpaceRadius: false
+  });
+  aoPass.updatePdMaterial({ lumaPhi: 8, depthPhi: 2.2, normalPhi: 3.6, radius: 4, samples: 8 });
+  aoPass.blendIntensity = 1.0;
+  composer.addPass(aoPass);
   bloomPass = new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight), 0.28, 0.85, 0.98);
   composer.addPass(bloomPass);
   gradePass = new ShaderPass(GradeShader);
@@ -2103,6 +2630,7 @@ addEventListener('resize', ()=>{
   camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
   composer.setSize(innerWidth, innerHeight);
+  if(aoPass) aoPass.setSize(innerWidth, innerHeight);
   if(smaaPass) smaaPass.setSize(innerWidth*renderer.getPixelRatio(), innerHeight*renderer.getPixelRatio());
 });
 
@@ -2110,8 +2638,10 @@ addEventListener('resize', ()=>{
    СТАРТ
 ============================================================================ */
 function build(){
-  scene.fog = new THREE.FogExp2(0x8a8272, 0.0062);
-  scene.background = new THREE.Color(0x11100e);
+  scene.fog = new THREE.FogExp2(0x9aa0a6, 0.0048);
+  scene.background = new THREE.Color(0x14151a);
+  buildSky();
+  buildEnvironment();
   buildMaterials();
   buildLights();
   buildHangar();
@@ -2120,6 +2650,7 @@ function build(){
   buildServices();
   buildShootHouse();
   buildProps();
+  buildExtraProps();
   flushBuckets();
   buildDecals();
   buildShafts();
