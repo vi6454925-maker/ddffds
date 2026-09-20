@@ -228,7 +228,7 @@ function osbMaps(size=1024, tint=1){
   const [rg,rx] = cv(size,size);
   // Текстура покрывает ~1.22 м (ширина листа) → 1 px ≈ 1.2 мм.
   // Реальная щепа ОСП: длина 50-150 мм, ширина 10-25 мм → 40-125 px x 8-20 px.
-  x.fillStyle = `rgb(${206*tint|0},${181*tint|0},${136*tint|0})`; x.fillRect(0,0,size,size);
+  x.fillStyle = `rgb(${212*tint|0},${183*tint|0},${133*tint|0})`; x.fillRect(0,0,size,size);
   hx.fillStyle = '#6a6a6a'; hx.fillRect(0,0,size,size);
   rx.fillStyle = '#b8b8b8'; rx.fillRect(0,0,size,size);
 
@@ -244,10 +244,10 @@ function osbMaps(size=1024, tint=1){
       const px = srnd()*size, py = srnd()*size;
       // Щепа берётся из разных частей ствола: светлая заболонь и тёмное ядро.
       const lum = sr(0.88, 1.08);
-      const warm = sr(0.88, 1.06);
-      const r = clamp(224*lum*tint, 0, 255)|0,
-            g = clamp(199*lum*tint*warm, 0, 255)|0,
-            b = clamp(152*lum*tint*warm*sr(0.94,1.05), 0, 255)|0;
+      const warm = sr(0.90, 1.04);
+      const r = clamp(230*lum*tint, 0, 255)|0,
+            g = clamp(198*lum*tint*warm, 0, 255)|0,
+            b = clamp(144*lum*tint*warm*sr(0.95,1.04), 0, 255)|0;
       const op = sr(L.op[0], L.op[1]);
       const hv = Math.round(sr(L.hz[0], L.hz[1])*255);
       const rr = Math.min(hh*0.42, 5);
@@ -308,7 +308,7 @@ function osbMaps(size=1024, tint=1){
     const px=srnd()*size, py=srnd()*size, r=sr(10,58), v=si(186,214);
     wrapDraw(x, size, ()=>{
       const g = x.createRadialGradient(px,py,1,px,py,r);
-      g.addColorStop(0,`rgba(${v+16},${v+6},${v-14},${sr(.07,.18)})`); g.addColorStop(1,'rgba(0,0,0,0)');
+      g.addColorStop(0,`rgba(${v+22},${v+8},${v-18},${sr(.06,.15)})`); g.addColorStop(1,'rgba(0,0,0,0)');
       x.fillStyle=g; x.beginPath(); x.arc(px,py,r,0,7); x.fill();
     });
   }
@@ -322,13 +322,13 @@ function concreteMaps(size=768){
   const [h,hx] = cv(size,size);
   const [rg,rx] = cv(size,size);
   // Промышленный бетон — нейтрально-серый с лёгкой тёплой примесью, не бежевый.
-  x.fillStyle='#93908a'; x.fillRect(0,0,size,size);
+  x.fillStyle='#86837d'; x.fillRect(0,0,size,size);
   hx.fillStyle='#aaaaaa'; hx.fillRect(0,0,size,size);
   rx.fillStyle='#e0e0e0'; rx.fillRect(0,0,size,size);
   // облачные пятна затирки
   for(let i=0;i<340;i++){
-    const v = si(112,168);
-    const px=srnd()*size, py=srnd()*size, r=sr(10,70), al=sr(.03,.13);
+    const v = si(98,164);
+    const px=srnd()*size, py=srnd()*size, r=sr(10,70), al=sr(.04,.16);
     wrapDraw(x, size, ()=>{ x.fillStyle=`rgba(${v},${v-2},${v-7},${al})`;
       x.beginPath(); x.arc(px,py,r,0,7); x.fill(); });
   }
@@ -408,42 +408,106 @@ function lumberMaps(size=512){
   const [c,x] = cv(size,size);
   const [h,hx] = cv(size,size);
   const [rg,rx] = cv(size,size);
-  x.fillStyle='#c6b189'; x.fillRect(0,0,size,size);
-  hx.fillStyle='#909090'; hx.fillRect(0,0,size,size);
-  rx.fillStyle='#cdcdcd'; rx.fillRect(0,0,size,size);
-  for(let i=0;i<size;i+=1){
-    const w = sr(0.8,2.6);
-    const v = si(158,218);
-    x.strokeStyle = `rgba(${v},${(v*0.88)|0},${(v*0.66)|0},${sr(.16,.44)})`;
-    x.lineWidth = w; x.beginPath();
-    x.moveTo(0, i + Math.sin(i*0.21)*2.2); x.lineTo(size, i + Math.cos(i*0.17)*2.6); x.stroke();
-    const hv = si(120,180);
-    hx.strokeStyle = `rgba(${hv},${hv},${hv},.5)`; hx.lineWidth=w;
-    hx.beginPath(); hx.moveTo(0, i + Math.sin(i*0.21)*2.2); hx.lineTo(size, i + Math.cos(i*0.17)*2.6); hx.stroke();
+  // Сосновый брус: текстура кроется вдоль волокна, годовые слои идут полосами
+  // разной плотности, между ними — тёмная поздняя древесина.
+  x.fillStyle='#c9b48f'; x.fillRect(0,0,size,size);
+  hx.fillStyle='#8c8c8c'; hx.fillRect(0,0,size,size);
+  rx.fillStyle='#cacaca'; rx.fillRect(0,0,size,size);
+
+  // годовые слои: пары «ранняя светлая / поздняя тёмная» древесина
+  let y = 0;
+  while(y < size){
+    const early = sr(16, 44);         // светлая широкая зона
+    const late  = sr(1.4, 3.4);       // тёмная узкая зона
+    const wob   = sr(6, 16);          // изгиб слоя по длине
+    const phase = sr(0, 6.28);
+    const lumE  = sr(0.94, 1.06);
+    const lumL  = sr(0.76, 0.88);
+    for(let px=0; px<size; px++){
+      const off = Math.sin(px/size*Math.PI*2 + phase)*wob*0.35
+                + Math.sin(px/size*Math.PI*6 + phase*2)*wob*0.12;
+      // ранняя древесина
+      const ye = y + off;
+      x.fillStyle = `rgba(${clamp(214*lumE,0,255)|0},${clamp(189*lumE,0,255)|0},${clamp(146*lumE,0,255)|0},.85)`;
+      x.fillRect(px, ye, 1, early);
+      hx.fillStyle = `rgba(${clamp(176*lumE,0,255)|0},${clamp(176*lumE,0,255)|0},${clamp(176*lumE,0,255)|0},.8)`;
+      hx.fillRect(px, ye, 1, early);
+      rx.fillStyle = `rgba(${clamp(206*lumE,0,255)|0},${clamp(206*lumE,0,255)|0},${clamp(206*lumE,0,255)|0},.6)`;
+      rx.fillRect(px, ye, 1, early);
+      // поздняя древесина: темнее, плотнее, чуть ниже по высоте
+      const yl = ye + early;
+      x.fillStyle = `rgba(${clamp(168*lumL*1.15,0,255)|0},${clamp(134*lumL*1.15,0,255)|0},${clamp(92*lumL*1.15,0,255)|0},.8)`;
+      x.fillRect(px, yl, 1, late);
+      hx.fillStyle = `rgba(${clamp(96*lumL,0,255)|0},${clamp(96*lumL,0,255)|0},${clamp(96*lumL,0,255)|0},.85)`;
+      hx.fillRect(px, yl, 1, late);
+      rx.fillStyle = 'rgba(146,146,146,.55)';
+      rx.fillRect(px, yl, 1, late);
+    }
+    y += early + late;
   }
-  for(let i=0;i<7;i++){   // сучки
-    const px=srnd()*size, py=srnd()*size, r=sr(5,13);
+  // тонкие волокна поверх слоёв — придают дереву «ворс»
+  for(let i=0;i<size*1.1;i++){
+    const yy = srnd()*size, len = sr(size*0.2, size), x0 = srnd()*size;
+    const v = si(160, 215), a = sr(.03,.09);
+    x.strokeStyle = `rgba(${v},${(v*0.86)|0},${(v*0.64)|0},${a})`;
+    x.lineWidth = sr(0.5, 1.4);
+    x.beginPath();
+    x.moveTo(x0, yy);
+    x.bezierCurveTo(x0+len*0.33, yy+sr(-2.5,2.5), x0+len*0.66, yy+sr(-2.5,2.5), x0+len, yy+sr(-3,3));
+    x.stroke();
+  }
+  // сучки: тёмные овалы с расходящимися вокруг волокнами
+  for(let i=0;i<5;i++){
+    const px=srnd()*size, py=srnd()*size, rr=sr(6,15), ry=rr*sr(0.45,0.75);
     wrapDraw(x, size, ()=>{
-      const g=x.createRadialGradient(px,py,1,px,py,r);
-      g.addColorStop(0,'rgba(84,56,28,.92)'); g.addColorStop(.7,'rgba(110,78,42,.5)'); g.addColorStop(1,'rgba(110,78,42,0)');
-      x.fillStyle=g; x.beginPath(); x.arc(px,py,r,0,7); x.fill();
+      // волокна обтекают сучок
+      x.strokeStyle='rgba(126,96,54,.28)'; x.lineWidth=1.1;
+      for(let k=0;k<7;k++){
+        const o = (k-3)*rr*0.5;
+        x.beginPath();
+        x.moveTo(px-rr*3.4, py+o);
+        x.quadraticCurveTo(px, py+o*sr(1.5,2.4), px+rr*3.4, py+o);
+        x.stroke();
+      }
+      const g=x.createRadialGradient(px,py,1,px,py,rr);
+      g.addColorStop(0,'rgba(74,48,24,.95)'); g.addColorStop(.62,'rgba(104,70,36,.78)');
+      g.addColorStop(1,'rgba(128,92,52,0)');
+      x.fillStyle=g; x.beginPath(); x.ellipse(px,py,rr,ry,sr(0,3),0,7); x.fill();
     });
     wrapDraw(hx, size, ()=>{
-      const g=hx.createRadialGradient(px,py,1,px,py,r);
-      g.addColorStop(0,'rgba(60,60,60,.9)'); g.addColorStop(1,'rgba(144,144,144,0)');
-      hx.fillStyle=g; hx.beginPath(); hx.arc(px,py,r,0,7); hx.fill();
+      const g=hx.createRadialGradient(px,py,1,px,py,rr);
+      g.addColorStop(0,'rgba(54,54,54,.9)'); g.addColorStop(1,'rgba(140,140,140,0)');
+      hx.fillStyle=g; hx.beginPath(); hx.ellipse(px,py,rr,ry,0,0,7); hx.fill();
+    });
+    wrapDraw(rx, size, ()=>{
+      const g=rx.createRadialGradient(px,py,1,px,py,rr);
+      g.addColorStop(0,'rgba(108,108,108,.8)'); g.addColorStop(1,'rgba(108,108,108,0)');
+      rx.fillStyle=g; rx.beginPath(); rx.ellipse(px,py,rr,ry,0,0,7); rx.fill();
     });
   }
-  // строганые грани глаже, распил шершавее
-  for(let i=0;i<90;i++){
-    const px=srnd()*size, py=srnd()*size, r=sr(10,54), v=si(120,205);
+  // следы пилы и заводская маркировка-штамп
+  for(let i=0;i<8;i++){
+    const yy=srnd()*size;
+    x.strokeStyle=`rgba(${si(160,196)},${si(140,172)},${si(110,140)},.07)`;
+    x.lineWidth=sr(1.5,4);
+    x.beginPath(); x.moveTo(0,yy); x.lineTo(size,yy+sr(-3,3)); x.stroke();
+  }
+  // серые потёртости и грязь от рук/опалубки
+  for(let i=0;i<70;i++){
+    const px=srnd()*size, py=srnd()*size, r=sr(10,54), v=si(120,168);
+    wrapDraw(x, size, ()=>{
+      const g=x.createRadialGradient(px,py,1,px,py,r);
+      g.addColorStop(0,`rgba(${v},${v-6},${v-20},${sr(.05,.16)})`); g.addColorStop(1,'rgba(0,0,0,0)');
+      x.fillStyle=g; x.beginPath(); x.arc(px,py,r,0,7); x.fill();
+    });
     wrapDraw(rx, size, ()=>{
       const g=rx.createRadialGradient(px,py,1,px,py,r);
-      g.addColorStop(0,`rgba(${v},${v},${v},${sr(.1,.3)})`); g.addColorStop(1,'rgba(0,0,0,0)');
+      g.addColorStop(0,`rgba(${si(150,210)},${si(150,210)},${si(150,210)},${sr(.08,.26)})`);
+      g.addColorStop(1,'rgba(0,0,0,0)');
       rx.fillStyle=g; rx.beginPath(); rx.arc(px,py,r,0,7); rx.fill();
     });
   }
-  grain(x,size,size,0.03);
+  grain(x,size,size,0.028);
   return {albedo:c, height:h, rough:rg};
 }
 
@@ -812,7 +876,7 @@ function buildMaterials(){
   MAPS.osb   = osbMaps(1024, 1.0);
   MAPS.osb2  = osbMaps(1024, 0.92);
   MAPS.conc  = concreteMaps(768);
-  MAPS.wood  = lumberMaps(512);
+  MAPS.wood  = lumberMaps(768);
   MAPS.corr  = corrugatedMaps(512, 0.45, [124,118,110], 7);
   MAPS.roof  = corrugatedMaps(512, 0.62, [168,154,136], 6);
   MAPS.steel = steelMaps(512, [112,106,98]);
@@ -822,7 +886,7 @@ function buildMaterials(){
   M.osb   = mk(MAPS.osb , [1,1], 1.05, {rough:1.0, hStrength:2.2, ao:.95, env:.28});
   M.osb2  = mk(MAPS.osb2, [1,1], 1.05, {rough:1.0, hStrength:2.2, ao:.95, env:.28});
   M.conc  = mk(MAPS.conc, [1,1], 0.80, {rough:1.0, ao:.95, env:.22, aoPower:1.15});
-  M.wood  = mk(MAPS.wood, [1,1], 0.85, {rough:1.0, ao:.85, env:.28});
+  M.wood  = mk(MAPS.wood, [1,1], 0.5, {rough:1.0, ao:.75, env:.28, hStrength:1.2});
   M.corr  = mk(MAPS.corr, [1,1], 1.20, {rough:1.0, metal:.25, side:THREE.DoubleSide, env:1.0, ao:.6});
   M.roof  = mk(MAPS.roof, [1,1], 1.15, {rough:1.0, metal:.15, side:THREE.DoubleSide, env:1.0, ao:.55});
   M.steel = mk(MAPS.steel,[1,1], 0.95, {rough:1.0, metal:.35, env:1.0, ao:.6});
@@ -859,12 +923,16 @@ function bucket(k){ if(!BUCKET.has(k)) BUCKET.set(k,[]); return BUCKET.get(k); }
 const _m4 = new THREE.Matrix4(), _q = new THREE.Quaternion(), _e = new THREE.Euler(), _v = new THREE.Vector3();
 
 /** UV по мировому размеру: текстура не растягивается на больших гранях. */
-function uvBox(g, sx,sy,sz, d){
+function uvBox(g, sx,sy,sz, d, alignGrain){
   const uv = g.attributes.uv;
   const s = [[sz,sy],[sz,sy],[sx,sz],[sx,sz],[sx,sy],[sx,sy]];
   for(let f=0; f<6; f++) for(let i=0;i<4;i++){
     const k = f*4+i;
-    uv.setXY(k, uv.getX(k)*s[f][0]*d, uv.getY(k)*s[f][1]*d);
+    let u = uv.getX(k)*s[f][0]*d, v = uv.getY(k)*s[f][1]*d;
+    // Текстура дерева нарисована волокном вдоль U. Если длинная сторона грани
+    // идёт по V, меняем оси — иначе слои ложатся поперёк бруса.
+    if(alignGrain && s[f][1] > s[f][0]){ const t=u; u=v; v=t; }
+    uv.setXY(k, u, v);
   }
   uv.needsUpdate = true;
 }
@@ -1210,7 +1278,7 @@ function buildWall(x1,z1,x2,z2, y0,h, opt={}){
   const put = (t0,t1,yc,sy,mat,nOff,tk,d)=>{
     const L=t1-t0; if(L<=0.012) return;
     const [cx,cy,cz]=P(t0+L/2,nOff,yc);
-    const g=new THREE.BoxGeometry(tk,sy,L); uvBox(g,tk,sy,L,d??0.5);
+    const g=new THREE.BoxGeometry(tk,sy,L); uvBox(g,tk,sy,L,d??0.5, mat==='wood');
     _e.set(0,ang,0); _q.setFromEuler(_e);
     _m4.compose(new THREE.Vector3(cx,cy,cz),_q,new THREE.Vector3(1,1,1));
     g.applyMatrix4(_m4); bucket(mat).push(g);
@@ -1335,7 +1403,7 @@ function railing(x1,z1,x2,z2, y=F2+DECK_T, h=1.04, opt={}){
     addBox('wood', x1+ux*t, y+h/2, z1+uz*t, 0.09,h,0.09, {collide:false, d:.95});
   }
   for(const yy of [y+h-0.045, y+h*0.52]){
-    const g=new THREE.BoxGeometry(0.065,0.09,len); uvBox(g,0.065,0.09,len,.95);
+    const g=new THREE.BoxGeometry(0.065,0.09,len); uvBox(g,0.065,0.09,len,.95,true);
     _e.set(0,ang,0); _q.setFromEuler(_e);
     _m4.compose(new THREE.Vector3((x1+x2)/2,yy,(z1+z2)/2),_q,new THREE.Vector3(1,1,1));
     g.applyMatrix4(_m4); bucket('wood').push(g);
@@ -1497,7 +1565,7 @@ const FILLS=[], LIGHT_POOL=[], SHAFTS=[];
 let sunTarget;
 
 function buildLights(){
-  hemi = new THREE.HemisphereLight(0x9ab4d0, 0x7d7264, 0.62); scene.add(hemi);
+  hemi = new THREE.HemisphereLight(0xaebfd0, 0x8a7e6c, 0.68); scene.add(hemi);
   ambient = new THREE.AmbientLight(0xdfe3e6, 0.16); scene.add(ambient);
 
   sun = new THREE.DirectionalLight(0xfff2dc, 5.4);
@@ -1644,7 +1712,7 @@ function updateLightPool(pos){
 function setNight(on){
   NIGHT = on;
   sun.intensity = on ? 0.06 : 4.6;
-  hemi.intensity = on ? 0.12 : 0.62;
+  hemi.intensity = on ? 0.12 : 0.68;
   ambient.intensity = on ? 0.05 : 0.20;
   FILLS.forEach((f,i)=> f.intensity = on ? 0.03 : [0.5,0.34,0.28,0.55][i]);
   for(const s of SHAFTS) s.visible = !on;
@@ -2541,8 +2609,8 @@ function update(dt){
 ============================================================================ */
 const GradeShader = {
   uniforms:{
-    tDiffuse:{value:null}, uVig:{value:0.18}, uSat:{value:0.99},
-    uShadowTint:{value:new THREE.Color(0.70,0.78,0.96)},   // холодные тени
+    tDiffuse:{value:null}, uVig:{value:0.18}, uSat:{value:1.04},
+    uShadowTint:{value:new THREE.Color(0.78,0.84,0.98)},   // холодные тени
     uHighTint:{value:new THREE.Color(1.06,1.00,0.90)},     // тёплые света
     uLift:{value:0.016}, uContrast:{value:1.12}, uTemp:{value:0.0}
   },
